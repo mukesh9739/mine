@@ -27,6 +27,7 @@
 # - Safety checks for disk space, internet, and required commands
 # - Automatically appends local CMake install to user's PATH permanently
 # - Build output using all available CPU cores
+# - Tracks memory and disk usage to estimate minimum requirements
 #
 # Usage:
 #   ./setup_qlever_env.sh
@@ -34,6 +35,10 @@
 
 set -e
 trap 'echo "❌ Script failed on line $LINENO. Check the output above for the error." >&2' ERR
+
+start_time=$(date +%s)
+initial_mem_kb=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
+initial_disk_kb=$(df --output=avail "$HOME" | tail -1)
 
 # ----- Safety Checks -----
 
@@ -231,4 +236,18 @@ elif [[ "$mode_choice" == "3" ]]; then
   echo "✅ Build complete."
 fi
 
+# ----- Final Stats -----
+
+end_time=$(date +%s)
+final_mem_kb=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
+final_disk_kb=$(df --output=avail "$HOME" | tail -1)
+
+mem_used_mb=$(( (initial_mem_kb - final_mem_kb) / 1024 ))
+disk_used_mb=$(( (initial_disk_kb - final_disk_kb) / 1024 ))
+duration=$(( end_time - start_time ))
+
+echo "📝 Final selection: Mode = $mode, Build type = $build"
+echo "🧠 Estimated RAM used: ${mem_used_mb} MB"
+echo "💾 Estimated disk space used: ${disk_used_mb} MB"
+echo "⏱️ Duration: $((duration / 60)) minutes $((duration % 60)) seconds"
 echo "🎉 QLever environment is ready!"
