@@ -1,50 +1,47 @@
 #!/bin/bash
 
 # ------------------------------------------------------------------------------
-# QLever Environment Setup Script
+# QLever Environment Setup Script with Resource Usage Tracking
 # ------------------------------------------------------------------------------
-# This script helps you set up and build the QLever project in a Linux or WSL environment.
+# 📦 Automates:
+#   1. Dependency installation (with disk estimate)
+#   2. CMake installation (ARM-aware or local)
+#   3. QLever cloning
+#   4. Full or minimal build with RAM/disk tracking
 #
-# ✔ Three modes of operation:
-#   [1] Full setup: installs dependencies, installs CMake, clones and builds QLever.
-#   [2] Rebuild only: reconfigures and rebuilds QLever from source.
-#   [3] Quick make: just runs `make` assuming CMake config is already done.
-#
-# 📊 Tracks:
-#   - Build memory usage
-#   - Disk space usage
+# 📊 Reports:
+#   - Peak RAM during make
+#   - Disk used after each step
 #   - Total execution time
-#
-# ❗ Prevents build issues caused by MSYS2/MinGW path leaks in WSL or mixed environments.
 # ------------------------------------------------------------------------------
 
-# ===== SAFETY: CLEANUP WINDOWS PATH CONTAMINATION (WSL/MSYS2) =====
-unset CPATH
-unset C_INCLUDE_PATH
-unset CPLUS_INCLUDE_PATH
-unset LIBRARY_PATH
-unset LD_LIBRARY_PATH
+unset CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH LIBRARY_PATH LD_LIBRARY_PATH
 export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v '/mnt/c/msys64' | paste -sd:)
 
-# ===== ERROR HANDLING =====
 set -e
-trap 'echo "❌ Script failed on line $LINENO. Check the output above for the error." >&2' ERR
+trap 'echo "❌ Script failed on line $LINENO" >&2' ERR
 
-# ===== MEASURE START =====
 start_time=$(date +%s)
-initial_mem_kb=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
-initial_disk_kb=$(df --output=avail "$HOME" | tail -1)
 
-# ===== ENVIRONMENT CHECKS =====
+# -------- Resource Tracking Setup --------
+report_disk_usage() {
+  local label="$1"
+  local usage_gb
+  usage_gb=$(du -s --block-size=1G "$QLEVER_DIR" 2>/dev/null | awk '{print $1}')
+  echo "💾 [$label] Disk used by QLever folder: ${usage_gb:-0} GB"
+}
 
+disk_before_deps=$(df "$HOME" --output=avail | tail -1)
+
+# -------- Sanity Checks --------
 if [ "$(id -u)" -eq 0 ]; then
-  echo "❌ Please do NOT run this script as root. Run it as a regular user."
+  echo "❌ Do not run this script as root."
   exit 1
 fi
 
-for cmd in wget git sudo; do
+for cmd in wget git sudo du df awk grep make; do
   if ! command -v "$cmd" &>/dev/null; then
-    echo "❌ Required command '$cmd' is not installed. Run: sudo apt install $cmd"
+    echo "❌ '$cmd' not installed. Run: sudo apt install $cmd"
     exit 1
   fi
 done
@@ -54,39 +51,30 @@ if ! ping -c 1 github.com &>/dev/null; then
   exit 1
 fi
 
-required_space_mb=5000
 available_space_mb=$(df "$HOME" | awk 'NR==2 {print int($4/1024)}')
-if (( available_space_mb < required_space_mb )); then
-  echo "❌ Not enough disk space. At least ${required_space_mb}MB required."
+if (( available_space_mb < 5000 )); then
+  echo "❌ At least 5 GB free disk space required."
   exit 1
 fi
 
-# ===== DEPENDENCY & CMAKE INSTALLATION =====
+# -------- Install Dependencies & CMake --------
 install_dependencies_and_cmake() {
-  echo "📦 Removing old CMake if present..."
-  if dpkg -l | grep -q "^ii  cmake "; then
-    sudo apt remove --purge -y cmake
-  fi
-
-  echo "🧹 Installing QLever dependencies..."
-  packages=(build-essential g++ git libssl-dev zlib1g-dev libcurl4-openssl-dev libreadline-dev libboost-all-dev libbz2-dev libjemalloc-dev pkg-config libzstd-dev)
-
-  for pkg in "${packages[@]}"; do
-    if dpkg -l | grep -q "^ii  $pkg "; then
-      sudo apt remove --purge -y "$pkg"
-    fi
-  done
-
-  sudo apt autoremove -y
+  echo "📦 Installing dependencies..."
   sudo apt update
-  sudo apt install -y "${packages[@]}"
+  sudo apt install -y build-essential g++ git libssl-dev zlib1g-dev \
+    libcurl4-openssl-dev libreadline-dev libboost-all-dev \
+    libbz2-dev libjemalloc-dev pkg-config libzstd-dev time
+
+  disk_after_deps=$(df "$HOME" --output=avail | tail -1)
+  disk_used_deps_mb=$(( (disk_before_deps - disk_after_deps) / 1024 ))
+  echo "💽 Disk used by dependencies: ~$((disk_used_deps_mb / 1024)) GB"
 
   ARCH=$(uname -m)
   if [[ "$ARCH" == "aarch64" ]]; then
-    echo "🧠 ARM detected: using Kitware repo for CMake..."
+    echo "🧠 ARM detected: installing CMake via Kitware repo..."
     sudo apt install -y software-properties-common
-    sudo apt-add-repository 'deb https://apt.kitware.com/ubuntu/ focal main'
-    wget https://apt.kitware.com/keys/kitware-archive-latest.asc
+    sudo apt-add-repository -y 'deb https://apt.kitware.com/ubuntu/ focal main'
+    wget -q https://apt.kitware.com/keys/kitware-archive-latest.asc
     sudo apt-key add kitware-archive-latest.asc
     sudo apt update
     sudo apt install -y cmake
@@ -98,68 +86,65 @@ install_dependencies_and_cmake() {
     mkdir -p "$HOME/cmake-4.0.1"
     ./cmake-4.0.1-linux-x86_64.sh --prefix="$HOME/cmake-4.0.1" --skip-license
     rm cmake-4.0.1-linux-x86_64.sh
-
     export PATH="$HOME/cmake-4.0.1/bin:$PATH"
-    if ! grep -q 'cmake-4.0.1/bin' ~/.bashrc; then
-      echo 'export PATH=$HOME/cmake-4.0.1/bin:$PATH' >> ~/.bashrc
-    fi
+    grep -q 'cmake-4.0.1' ~/.bashrc || echo 'export PATH=$HOME/cmake-4.0.1/bin:$PATH' >> ~/.bashrc
   fi
-
-  echo "✅ Installed CMake version:"
-  cmake --version
+  echo "✅ CMake version: $(cmake --version | head -n1)"
 }
 
-# ===== CLONE REPO =====
+# -------- Clone QLever Repo --------
 clone_qlever() {
-  if [ -d "qlever" ]; then
-    echo "⚠️ Removing existing 'qlever' directory..."
-    rm -rf qlever
-  fi
-  echo "📁 Cloning QLever repository..."
+  [ -d "qlever" ] && echo "⚠️ Removing existing qlever/..." && rm -rf qlever
+  echo "📁 Cloning QLever..."
   git clone --recursive https://github.com/ad-freiburg/qlever.git
+  QLEVER_DIR="$PWD/qlever"
+  report_disk_usage "After Clone"
 }
 
-# ===== CONFIGURE & BUILD =====
+# -------- Configure + Build with RAM Tracking --------
 configure_and_build() {
   cd "$QLEVER_DIR"
   rm -rf build
   mkdir build && cd build
 
+  echo "⚙️ Configuring build ($1)..."
   if [[ "$1" == "minimal" ]]; then
-    echo "⚙️ Configuring minimal build..."
     cmake .. -DCMAKE_BUILD_TYPE=Developer -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DBUILD_TESTING=OFF
   else
-    echo "⚙️ Configuring full build..."
     cmake .. -DCMAKE_BUILD_TYPE=Developer -DCMAKE_POLICY_VERSION_MINIMUM=3.5
   fi
 
-  echo "🔨 Running make..."
-  make -j$(nproc)
+  echo "🔨 Building with memory profiling..."
+  /usr/bin/time -v make -j$(nproc) 2> peak_mem.txt
+
+  peak_mem_kb=$(grep "Maximum resident set size" peak_mem.txt | awk '{print $6}')
+  peak_mem_mb=$((peak_mem_kb / 1024))
+  echo "🧠 Peak RAM during build: ${peak_mem_mb} MB"
+
   cd ../..
+  report_disk_usage "After Build"
 }
 
-# ===== INTERACTIVE PROMPT =====
+# -------- User Prompt --------
 while true; do
   echo "❓ Choose setup mode:"
-  echo "  [1] Full setup (deps, CMake, clone, build)"
-  echo "  [2] Rebuild only (delete & rebuild)"
-  echo "  [3] Quick make (run make in ./build)"
+  echo "  [1] Full setup (deps, cmake, clone, build)"
+  echo "  [2] Rebuild only"
+  echo "  [3] Quick make"
   read -p "Enter 1, 2 or 3: " mode_choice
 
   build="(not applicable)"
   build_type_flag=""
 
   if [[ "$mode_choice" == "1" || "$mode_choice" == "2" ]]; then
-    echo "⚖️ Choose build type:"
-    echo "  [1] Minimal build (QLeverServer only)"
-    echo "  [2] Full build (with tests)"
+    echo "⚖️ Build type:"
+    echo "  [1] Minimal (no tests)"
+    echo "  [2] Full (tests + benches)"
     read -p "Enter 1 or 2: " build_type_choice
     if [[ "$build_type_choice" == "1" ]]; then
-      build="Minimal"
-      build_type_flag="minimal"
+      build="Minimal"; build_type_flag="minimal"
     elif [[ "$build_type_choice" == "2" ]]; then
-      build="Full"
-      build_type_flag="full"
+      build="Full"; build_type_flag="full"
     else
       echo "❌ Invalid build type."; continue
     fi
@@ -171,51 +156,37 @@ while true; do
   else echo "❌ Invalid mode."; continue; fi
 
   echo ""
-  echo "📝 You selected:"
-  echo "  ➤ Mode: $mode"
-  echo "  ➤ Build type: $build"
+  echo "📝 You selected: ➤ Mode: $mode | ➤ Build type: $build"
   read -p "✅ Proceed? [y/n]: " confirm
   [[ "$confirm" =~ ^[Yy]$ ]] && break
 done
 
-# ===== LOCATE QLEVER DIR IF NOT NEW CLONE =====
-if [[ "$mode_choice" == "2" || "$mode_choice" == "3" ]]; then
-  if [ -d "qlever" ]; then
-    QLEVER_DIR="$PWD/qlever"
-  else
-    read -p "Enter path to QLever directory: " QLEVER_DIR
-    [ ! -d "$QLEVER_DIR" ] && echo "❌ Invalid path." && exit 1
-  fi
-fi
-
-# ===== EXECUTE BASED ON MODE =====
+# -------- Setup Based on Mode --------
 if [[ "$mode_choice" == "1" ]]; then
   install_dependencies_and_cmake
   clone_qlever
-  QLEVER_DIR="$PWD/qlever"
   configure_and_build "$build_type_flag"
 elif [[ "$mode_choice" == "2" ]]; then
+  if [ ! -d qlever ]; then read -p "Path to QLever: " QLEVER_DIR; else QLEVER_DIR="$PWD/qlever"; fi
   configure_and_build "$build_type_flag"
 elif [[ "$mode_choice" == "3" ]]; then
-  cd "$QLEVER_DIR/build" || { echo "❌ Build folder missing."; exit 1; }
+  [ ! -d qlever ] && read -p "Path to QLever: " QLEVER_DIR || QLEVER_DIR="$PWD/qlever"
+  cd "$QLEVER_DIR/build" || { echo "❌ Missing build folder."; exit 1; }
   make -j$(nproc)
-  echo "✅ Build complete."
+  report_disk_usage "Quick Make"
 fi
 
-# ===== MEASURE END =====
+# -------- Summary --------
 end_time=$(date +%s)
-final_mem_kb=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
-final_disk_kb=$(df --output=avail "$HOME" | tail -1)
-
-mem_used_mb=$(( (initial_mem_kb - final_mem_kb) / 1024 ))
-disk_used_mb=$(( (initial_disk_kb - final_disk_kb) / 1024 ))
-duration=$(( end_time - start_time ))
-duration_min=$(( duration / 60 ))
-duration_sec=$(( duration % 60 ))
+duration=$((end_time - start_time))
+duration_min=$((duration / 60))
+duration_sec=$((duration % 60))
 
 echo ""
-echo "📝 Final selection: Mode = $mode, Build type = $build"
-echo "🧠 Estimated RAM used: ${mem_used_mb} MB"
-echo "💾 Estimated disk space used: ${disk_used_mb} MB"
-echo "⏱️ Duration: ${duration_min} minutes ${duration_sec} seconds"
+echo "📝 Final Summary:"
+echo "  ➤ Mode:       $mode"
+echo "  ➤ Build type: $build"
+echo "  🧠 Peak RAM:  ${peak_mem_mb:-unknown} MB"
+echo "  💽 Disk used: $(du -s --block-size=1G "$QLEVER_DIR" | awk '{print $1}') GB"
+echo "  ⏱️ Time:       ${duration_min}m ${duration_sec}s"
 echo "🎉 QLever environment is ready!"
